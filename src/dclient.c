@@ -5,7 +5,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include "../include/common.h"
+#include "common.h"
 
 
 void show_usage(char *program_name) {

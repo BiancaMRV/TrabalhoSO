@@ -8,12 +8,63 @@
 #include <signal.h>
 #include "../include/common.h"
 
-// Variáveis globais
+
 char document_folder[MAX_PATH_SIZE];
 int cache_size;
 Document *documents = NULL;  // Array de documentos
 int next_id = 1;             // Próximo ID disponível
 int num_documents = 0;       // Número atual de documentos
+
+// Declarações de funções - adicionadas para resolver os erros de compilação
+int search_documents_sequential(const char *keyword, int *doc_ids, int max_results);
+int search_for_keyword(const char *filepath, const char *keyword);
+int count_keyword_lines(const char *filepath, const char *keyword);
+int search_documents(const char *keyword, int *doc_ids, int max_results, int nr_processes);
+
+// Função para verificar se um arquivo contém uma palavra-chave
+int search_for_keyword(const char *filepath, const char *keyword) {
+    int fd = open(filepath, O_RDONLY);
+    if (fd == -1) {
+        perror("Erro ao abrir arquivo para busca");
+        return 0; // Arquivo não existe ou erro
+    }
+    
+    char buffer[4096];
+    int bytes_read;
+    int result = 0;
+    
+    while ((bytes_read = read(fd, buffer, sizeof(buffer) - 1)) > 0) {
+        // Garantir que o buffer termine com \0 para usar strstr
+        buffer[bytes_read] = '\0';
+        
+        if (strstr(buffer, keyword) != NULL) {
+            result = 1;
+            break;
+        }
+    }
+    
+    close(fd);
+    return result;
+}
+
+// Função de pesquisa sequencial 
+int search_documents_sequential(const char *keyword, int *doc_ids, int max_results) {
+    int count = 0;
+    
+    for (int i = 0; i < num_documents && count < max_results; i++) {
+        // Construir caminho completo
+        char full_path[MAX_PATH_SIZE * 2];
+        sprintf(full_path, "%s/%s", document_folder, documents[i].path);
+        
+        // Usar a nossa própria função de busca
+        if (search_for_keyword(full_path, keyword)) {
+            // Palavra-chave encontrada
+            doc_ids[count++] = documents[i].id;
+        }
+    }
+    
+    return count;
+}
 
 // Função para inicializar o servidor
 int initialize_server() {
@@ -66,7 +117,7 @@ int add_document(ClientMessage *msg) {
     Document doc;
     doc.id = next_id++;
     strncpy(doc.title, msg->title, MAX_TITLE_SIZE - 1);
-    doc.title[MAX_TITLE_SIZE - 1] = '\0';  // Garantir terminação
+    doc.title[MAX_TITLE_SIZE - 1] = '\0';  // Garantir encerramento
     strncpy(doc.authors, msg->authors, MAX_AUTHORS_SIZE - 1);
     doc.authors[MAX_AUTHORS_SIZE - 1] = '\0';
     strncpy(doc.year, msg->year, MAX_YEAR_SIZE - 1);
@@ -134,31 +185,152 @@ int count_lines(int doc_id, const char *keyword) {
     return atoi(buffer);
 }
 
-// Pesquisar documentos com uma palavra-chave
-int search_documents(const char *keyword, int *doc_ids, int max_results) {
-    int count = 0;
+
+int search_documents(const char *keyword, int *doc_ids, int max_results, int nr_processes) {
+    // Se nr_processes for 1 ou menos, usar método sequencial
+    if (nr_processes <= 1) {
+        return search_documents_sequential(keyword, doc_ids, max_results);
+    }
     
-    for (int i = 0; i < num_documents && count < max_results; i++) {
-        // Construir caminho completo
-        char full_path[MAX_PATH_SIZE * 2];
-        sprintf(full_path, "%s/%s", document_folder, documents[i].path);
-        
-        // Construir comando grep
-        char command[512];
-        sprintf(command, "grep -q \"%s\" \"%s\"", keyword, full_path);
-        
-        // Executar comando
-        int result = system(command);
-        if (result == 0) {
-            // Palavra-chave encontrada
-            doc_ids[count++] = documents[i].id;
+    int count = 0;
+    int pipes[nr_processes][2];
+    pid_t pids[nr_processes];
+    
+    // Limitar número de processos ao número de documentos
+    if (nr_processes > num_documents) {
+        nr_processes = num_documents;
+    }
+    
+    // Criar pipes para comunicação
+    for (int i = 0; i < nr_processes; i++) {
+        if (pipe(pipes[i]) == -1) {
+            perror("Erro ao criar pipe");
+            // Se falhar em criar pipes, usar método sequencial
+            return search_documents_sequential(keyword, doc_ids, max_results);
         }
+    }
+    
+    // Dividir documentos entre processos
+    int docs_per_process = (num_documents + nr_processes - 1) / nr_processes;
+    
+    // Criar processos filhos
+    for (int i = 0; i < nr_processes; i++) {
+        pids[i] = fork();
+        
+        if (pids[i] == -1) {
+            perror("Erro ao criar processo");
+            // Se falhar em criar processo, usar apenas os já criados
+            nr_processes = i;
+            if (nr_processes == 0) {
+                return search_documents_sequential(keyword, doc_ids, max_results);
+            }
+            break;
+        }
+        
+        if (pids[i] == 0) {
+            // Código do processo filho
+            
+          
+            for (int j = 0; j < nr_processes; j++) {
+                if (j != i) {
+                    close(pipes[j][0]);
+                    close(pipes[j][1]);
+                }
+            }
+            
+            close(pipes[i][0]); 
+            
+            int start = i * docs_per_process;
+            int end = (i + 1) * docs_per_process;
+            if (end > num_documents) end = num_documents;
+            
+            int child_count = 0;
+            int child_results[end - start];
+            
+            // Pesquisar documentos alocados a este processo
+            for (int j = start; j < end; j++) {
+                char full_path[MAX_PATH_SIZE * 2];
+                sprintf(full_path, "%s/%s", document_folder, documents[j].path);
+                
+                if (search_for_keyword(full_path, keyword)) {
+                    child_results[child_count++] = documents[j].id;
+                }
+            }
+            
+            // Enviar resultados para o processo pai
+            if (write(pipes[i][1], &child_count, sizeof(int)) < 0) {
+                perror("Erro ao escrever contagem no pipe");
+            }
+            
+            if (child_count > 0) {
+                if (write(pipes[i][1], child_results, sizeof(int) * child_count) < 0) {
+                    perror("Erro ao escrever resultados no pipe");
+                }
+            }
+            
+            close(pipes[i][1]);
+            _exit(0); 
+        } else {
+            // Processo pai
+            close(pipes[i][1]); 
+        }
+    }
+    
+    // Coletar resultados dos processos filhos
+    for (int i = 0; i < nr_processes; i++) {
+        int child_count = 0;
+        int read_result = read(pipes[i][0], &child_count, sizeof(int));
+        
+        if (read_result <= 0) {
+            // Erro na leitura ou pipe fechado
+            fprintf(stderr, "Aviso: Falha ao ler do processo %d\n", i);
+            close(pipes[i][0]);
+            continue;
+        }
+        
+        if (child_count > 0) {
+            int child_results[child_count];
+            if (read(pipes[i][0], child_results, sizeof(int) * child_count) <= 0) {
+                fprintf(stderr, "Aviso: Falha ao ler resultados do processo %d\n", i);
+            } else {
+                // Adicionar resultados ao array final
+                for (int j = 0; j < child_count && count < max_results; j++) {
+                    doc_ids[count++] = child_results[j];
+                }
+            }
+        }
+        
+        close(pipes[i][0]);
+        
+        // Esperar pelo encerramento do processo filho com timeout
+        int status;
+        pid_t wait_result = waitpid(pids[i], &status, WNOHANG);
+        
+        if (wait_result == 0) {
+            // Processo ainda em execução, dar um tempo adicional
+            usleep(100000); // 100ms
+            wait_result = waitpid(pids[i], &status, WNOHANG);
+            
+            if (wait_result == 0) {
+                // Se ainda estiver a executar, forçar encerramento
+                fprintf(stderr, "Aviso: Processo %d não terminou, enviando SIGTERM\n", i);
+                kill(pids[i], SIGTERM);
+                usleep(50000); // 50ms
+                waitpid(pids[i], NULL, WNOHANG);
+            }
+        }
+    }
+    
+    // Garantir que todos os processos filhos foram encerrados
+    for (int i = 0; i < nr_processes; i++) {
+        kill(pids[i], SIGTERM); 
+        waitpid(pids[i], NULL, WNOHANG);
     }
     
     return count;
 }
 
-// Função principal
+
 int main(int argc, char *argv[]) {
     // Verificar argumentos
     if (argc != 3) {
@@ -168,7 +340,7 @@ int main(int argc, char *argv[]) {
     
     // Obter argumentos
     strncpy(document_folder, argv[1], MAX_PATH_SIZE - 1);
-    document_folder[MAX_PATH_SIZE - 1] = '\0';  // Garantir terminação
+    document_folder[MAX_PATH_SIZE - 1] = '\0';  // Garantir encerramento
     
     cache_size = atoi(argv[2]);
     if (cache_size <= 0) {
@@ -272,9 +444,11 @@ int main(int argc, char *argv[]) {
                 case OP_SEARCH:
                     printf("Pesquisar documentos com palavra-chave: %s (processos: %d)\n", 
                            client_msg.keyword, client_msg.nr_processes);
+                   
                     server_response.doc_count = search_documents(client_msg.keyword, 
                                                                 server_response.doc_ids, 
-                                                                1024);
+                                                                1024,
+                                                                client_msg.nr_processes);
                     server_response.status = 0;
                     break;
                     
@@ -315,7 +489,6 @@ int main(int argc, char *argv[]) {
         }
     }
     
-  
     close(server_pipe);
     
     return 0;
